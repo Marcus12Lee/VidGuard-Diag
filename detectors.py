@@ -78,9 +78,22 @@ def macroblocking_seam_ratio(gray: np.ndarray, block: int) -> float:
     return aligned_mean / baseline
 
 
-def tearing_horizontal_spike(gray: np.ndarray, height: float) -> tuple[float, int]:
+def tearing_horizontal_spike(
+    gray: np.ndarray,
+    height: float,
+    ignore_top_pct: float = 0.0,
+    ignore_bottom_pct: float = 0.0,
+) -> tuple[float, int]:
     g = gray.astype(np.float32)
     h, w = g.shape
+
+    top_cut = int(round(h * max(0.0, min(0.95, ignore_top_pct))))
+    bottom_cut = int(round(h * max(0.0, min(0.95, ignore_bottom_pct))))
+    start = max(0, min(h - 1, top_cut))
+    end = max(start + 1, h - bottom_cut)
+    g = g[start:end, :]
+    h, w = g.shape
+
     if h < 8 or w < 16:
         return 0.0, -1
     mid = w // 2
@@ -116,6 +129,11 @@ class VideoValidator:
         solid_std_threshold: float = 2.0,
         macro_seam_ratio_threshold: float = 1.32,
         tear_row_delta: float = 18.0,
+        tear_min_consecutive: int = 2,
+        tear_row_tolerance_px: int = 10,
+        tear_ignore_top_pct: float = 0.0,
+        tear_ignore_bottom_pct: float = 0.0,
+        tear_static_row_frames: int = 10,
         pts_gap_factor: float = 1.85,
     ) -> None:
         self.video_path = Path(video_path)
@@ -129,6 +147,11 @@ class VideoValidator:
         self.solid_std_threshold = solid_std_threshold
         self.macro_seam_ratio_threshold = macro_seam_ratio_threshold
         self.tear_row_delta = tear_row_delta
+        self.tear_min_consecutive = max(1, int(tear_min_consecutive))
+        self.tear_row_tolerance_px = max(1, int(tear_row_tolerance_px))
+        self.tear_ignore_top_pct = float(min(0.95, max(0.0, tear_ignore_top_pct)))
+        self.tear_ignore_bottom_pct = float(min(0.95, max(0.0, tear_ignore_bottom_pct)))
+        self.tear_static_row_frames = max(0, int(tear_static_row_frames))
         self.pts_gap_factor = pts_gap_factor
         self.events: list[ArtifactEvent] = []
 
@@ -184,6 +207,12 @@ class VideoValidator:
         motion_hist: deque[float] = deque(maxlen=self.motion_window)
         frame_idx = -1
         fh, fw = 0, 0
+        tear_streak = 0
+        tear_last_row = -1
+        tear_pending_peak = 0.0
+        tear_pending_pts = -1.0
+        tear_pending_frame = -1
+        tear_row_static_streak = 0
 
         try:
             while True:
@@ -279,24 +308,70 @@ class VideoValidator:
                         on_artifact,
                     )
 
-                tear_peak, tear_row = tearing_horizontal_spike(gray_small, self.tear_row_delta)
+                tear_peak, tear_row = tearing_horizontal_spike(
+                    gray_small,
+                    self.tear_row_delta,
+                    ignore_top_pct=self.tear_ignore_top_pct,
+                    ignore_bottom_pct=self.tear_ignore_bottom_pct,
+                )
                 if tear_peak >= self.tear_row_delta and tear_row >= 0:
-                    sev = _norm_severity(tear_peak, self.tear_row_delta)
-                    sh = small.shape[0]
-                    y0 = max(0, int(round(tear_row * (fh / max(1, sh)))) - 6)
-                    self._emit(
-                        ArtifactEvent(
-                            timestamp_ms=pts_ms,
-                            frame_index=frame_idx,
-                            artifact_type="Tearing",
-                            severity_score=sev,
-                            message=f"Horizontal discontinuity spike (analysis row ~{tear_row})",
-                            metrics={"row_index_analysis": tear_row, "delta_score": tear_peak},
-                            bbox_xywh=(0, y0, fw, 12),
-                        ),
-                        frame,
-                        on_artifact,
-                    )
+                    if tear_last_row >= 0 and abs(tear_row - tear_last_row) <= self.tear_row_tolerance_px:
+                        tear_streak += 1
+                        tear_row_static_streak += 1
+                    else:
+                        tear_streak = 1
+                        tear_row_static_streak = 1
+                        tear_pending_peak = tear_peak
+                        tear_pending_pts = pts_ms
+                        tear_pending_frame = frame_idx
+                    tear_last_row = tear_row
+                    tear_pending_peak = max(tear_pending_peak, tear_peak)
+
+                    if tear_streak >= self.tear_min_consecutive:
+                        is_static_overlay = (
+                            self.tear_static_row_frames > 0
+                            and tear_row_static_streak >= self.tear_static_row_frames
+                        )
+                        if not is_static_overlay:
+                            sev = _norm_severity(tear_pending_peak, self.tear_row_delta)
+                            sh = small.shape[0]
+                            y0 = max(0, int(round(tear_row * (fh / max(1, sh)))) - 6)
+                            self._emit(
+                                ArtifactEvent(
+                                    timestamp_ms=tear_pending_pts if tear_pending_pts >= 0 else pts_ms,
+                                    frame_index=tear_pending_frame if tear_pending_frame >= 0 else frame_idx,
+                                    artifact_type="Tearing",
+                                    severity_score=sev,
+                                    message=(
+                                        "Horizontal discontinuity spike repeated across "
+                                        f"{tear_streak} sampled frames (analysis row ~{tear_row})"
+                                    ),
+                                    metrics={
+                                        "row_index_analysis": tear_row,
+                                        "delta_score": tear_pending_peak,
+                                        "tear_streak": tear_streak,
+                                        "row_tolerance_px": self.tear_row_tolerance_px,
+                                        "ignore_top_pct": self.tear_ignore_top_pct,
+                                        "ignore_bottom_pct": self.tear_ignore_bottom_pct,
+                                    },
+                                    bbox_xywh=(0, y0, fw, 12),
+                                ),
+                                frame,
+                                on_artifact,
+                            )
+                        tear_streak = 0
+                        tear_last_row = -1
+                        tear_pending_peak = 0.0
+                        tear_pending_pts = -1.0
+                        tear_pending_frame = -1
+                        tear_row_static_streak = 0
+                else:
+                    tear_streak = 0
+                    tear_last_row = -1
+                    tear_pending_peak = 0.0
+                    tear_pending_pts = -1.0
+                    tear_pending_frame = -1
+                    tear_row_static_streak = 0
 
                 if prev_small is not None:
                     mse = _mse(gray_small, cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY))
