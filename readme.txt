@@ -134,6 +134,13 @@ Tool B — NR artifact diagnostic (main.py)
 
     python main.py /path/to/clip.mp4
 
+  Use a built-in threshold profile (recommended):
+
+    python main.py clip.mp4 --profile balanced
+    python main.py clip.mp4 --profile strict
+    python main.py clip.mp4 --profile robust
+    python main.py clip.mp4 --profile 8k
+
   Faster analysis (every 2nd frame in the scan loop):
 
     python main.py clip.mp4 --fast-scan 2
@@ -146,13 +153,37 @@ Tool B — NR artifact diagnostic (main.py)
 
     python main.py clip.mp4 --debug ./debug_frames
 
-  Combine report + debug + less console noise:
+  Combine report + debug + profile (detailed console output):
+
+    python main.py clip.mp4 --profile 8k --report ./report.json --debug ./debug_frames
+
+  If subtitle rows trigger false Tearing near the bottom:
+
+    python main.py clip.mp4 --profile 8k --tear-ignore-bottom-pct 0.15
+
+  If top logos/watermarks trigger false Tearing:
+
+    python main.py clip.mp4 --profile 8k --tear-ignore-top-pct 0.06
+
+  Suppress static-row overlay hits (subtitle/logo row stays fixed):
+
+    python main.py clip.mp4 --profile 8k --tear-static-row-frames 8
+
+  Tighten/loosen tearing confirmation:
+
+    python main.py clip.mp4 --tear-consecutive 3 --tear-row-tol 12 --tear-delta 24
+
+  Less console noise:
 
     python main.py clip.mp4 --report ./report.json --debug ./debug_frames -q
 
   If the container lies about timing, hint FPS for PTS checks:
 
     python main.py clip.mp4 --fps-hint 29.97
+
+  Startup print includes all effective settings (profile + overrides):
+
+    INFO Effective settings: profile=... fast_scan=... freeze_mse=... macro_ratio=...
 
   Example — PASS (exit code 0). Console (INFO):
 
@@ -172,6 +203,12 @@ Tool B — NR artifact diagnostic (main.py)
   Example — missing file (exit code 2):
 
     File not found: /path/to/missing.mp4
+
+  Common profile intent:
+    balanced = general 4K/8K baseline
+    strict   = more sensitive (more findings, more false positives)
+    robust   = fewer false positives on noisy/overlay-heavy content
+    8k       = high-resolution focused defaults
 
   Exit codes: 0 = PASS, 1 = FAIL (one or more artifacts), 2 = error.
 
